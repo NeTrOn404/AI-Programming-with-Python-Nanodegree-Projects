@@ -1,0 +1,207 @@
+import argparse
+import os
+import time
+import torch
+import json
+
+from torch import nn, optim
+from torchvision import datasets, models, transforms
+from collections import OrderedDict
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torchvision
+import PIL
+
+parser = argparse.ArgumentParser (description = 'Parser _ train')
+
+parser.add_argument ('data_dir', help = 'data directory', type=str)
+parser.add_argument ('--save_dir', help = 'save directory',  type=str)
+parser.add_argument ('--arch', help = ' Alexnet, otherwise input VGG19', type=str, default='alexnet')
+parser.add_argument ('--learn_rate', help = 'Learning rate is 0.001 for alexnet', type = float, default = 0.001)
+parser.add_argument ('--hid_units', help = 'Hid units. Default is 2048 for alexnet', type = int, default = 2048)
+parser.add_argument ('--epo', help = 'Epochs default is 5 for alexnet', type = int, default = 5)
+parser.add_argument ('--GPU', help = "For Gpu Drop GPU ", type = str)
+
+args = parser.parse_args()
+
+data_dir = args.data_dir
+train_dir = data_dir + '/train'
+valid_dir = data_dir + '/valid'
+test_dir = data_dir + '/test'
+
+train_d = transforms.Compose([ transforms.RandomRotation(30), transforms.RandomResizedCrop(224),
+                                 transforms.RandomHorizontalFlip(), transforms.ToTensor(), 
+                                 transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                                 ])
+test_d = transforms.Compose([ transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
+                                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+valid_d = transforms.Compose([ transforms.Resize(256), transforms.CenterCrop(224), transforms.ToTensor(),
+                              transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                              ])
+
+image_datasets = [
+    datasets.ImageFolder(train_dir, transform = train_d),
+    datasets.ImageFolder(valid_dir, transform = valid_d),
+    datasets.ImageFolder(test_dir, transform = test_d)
+]
+
+
+dataloaders = [
+    torch.utils.data.DataLoader(image_datasets[0], batch_size=64, shuffle=True),
+    torch.utils.data.DataLoader(image_datasets[1], batch_size=64, shuffle=True),
+    torch.utils.data.DataLoader(image_datasets[2], batch_size=64, shuffle=True)
+] 
+
+
+# Label mapping
+with open('cat_to_name.json', 'r') as f:
+    cat_to_name = json.load(f)
+    
+    
+# BUILDING AND TRAINING CLASSIFIER
+
+
+if args.arch == 'vgg19':
+    
+    model = models.vgg19(pretrained=True)
+    
+    in_layer = 25088
+
+else:
+    model = models.alexnet(pretrained=True)
+    in_layer = 9216
+    
+    
+for param in model.parameters():
+    param.requires_grad = False
+    
+if args.hid_units != None:
+    classifier = nn.Sequential(OrderedDict([
+                            ('fc1', nn.Linear (in_layer, args.hid_units)), ('relu1', nn.ReLU ()), ('dropout1', nn.Dropout (p = 0.3)),
+                            ('fc2', nn.Linear (args.hid_units, 2048)), ('relu2', nn.ReLU ()), ('dropout2', nn.Dropout (p = 0.3)),
+                            ('fc3', nn.Linear (2048, 102)), ('output', nn.LogSoftmax (dim =1))
+                            ]))
+    
+else:
+    classifier = nn.Sequential(OrderedDict([
+    ('fc1', nn.Linear(in_layer, 4096)),
+    ('relu', nn.ReLU()),
+    ('fc2', nn.Linear(4096, 2048)),
+    ('relu', nn.ReLU()),
+    ('fc3', nn.Linear(2048, 102)),
+    ('output', nn.LogSoftmax(dim=1))
+]))
+
+model.classifier = classifier
+
+criterion = nn.NLLLoss()
+optimizer = optim.Adam(model.classifier.parameters(), args.learn_rate)
+
+if args.GPU == 'GPU':
+    dev = 'cuda'
+    print(" GPU Enabled")
+else:
+    dev = 'cpu'
+
+#validation
+def validation(model, valid_loader, criterion):
+    valid_loader = dataloaders[2]
+    model.to(dev)
+    
+    valid_loss = 0
+    accuracy = 0
+    for inputs, labels in valid_loader:
+        
+        inputs, labels = inputs.to(dev), labels.to(dev)
+        output = model.forward(inputs)
+        valid_loss += criterion(output, labels).item()
+
+        ps = torch.exp(output)
+        equality = (labels.data == ps.max(dim=1)[1])
+        accuracy += equality.type(torch.FloatTensor).mean()
+    
+    return valid_loss, accuracy
+
+model.to(dev)
+epochs = 5
+steps = 0
+running_loss = 0
+print_every = 30
+
+print(f"\n {args.epo} EPOCHS")
+print(f" {args.arch} Training...")
+print(f" {args.learn_rate} learning rate.")
+
+train_loader = dataloaders[0]
+test_loader = dataloaders[1]
+valid_loader = dataloaders[2]
+start = time.time()
+
+
+for epo in range(epochs):
+    for inputs, labels in train_loader:
+        steps += 1
+        inputs, labels = inputs.to(dev), labels.to(dev) 
+        optimizer.zero_grad()
+        logps = model.forward(inputs)
+        loss = criterion(logps, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+        
+        if steps % print_every == 0:
+            test_loss = 0
+            accuracy = 0
+            model.eval()
+            
+            with torch.no_grad():
+                for inputs, labels in valid_loader:
+                    inputs, labels = inputs.to(dev), labels.to(dev) 
+                    logps = model.forward(inputs)
+                    loss = criterion(logps, labels)
+                    test_loss += loss.item()
+
+                    #for accuracy
+                    ps = torch.exp(logps)
+                    top_p, top_class = ps.topk(1, dim=1)
+                    equals = top_class == labels.view(*top_class.shape)
+                    accuracy += torch.mean(equals.type(torch.FloatTensor)).item()
+                    #for valid
+                    valid_loss, accuracy = validation(model, valid_loader, criterion)
+
+            print("Epoch: {}/{}... ".format(epo+1, epochs),
+                  "Training Loss: {:.3f}... ".format(running_loss/print_every),
+                  "Testing Loss: {:.3f}... ".format(test_loss/len(valid_loader)), 
+                  "Testing Accuracy: {:.3f}... ".format(accuracy/len(valid_loader)),                               
+                  "Valid Loss: {:.3f}... ".format(valid_loss/len(valid_loader)),
+                  "Valid Accuracy: {:.3f}%".format(accuracy/len(valid_loader)*100))
+            running_loss = 0
+            model.train()
+            
+end = time.time()
+total_time = end - start
+print(" Trained finish in: {:.0f}m {:.0f}s".format(total_time//60, total_time % 60))
+
+
+# Checkpoint
+model.class_to_idx = image_datasets[0].class_to_idx
+
+bundle = {
+    ''arch': args.arch,
+    'input_size': 9216,
+    'output_size': 102,
+    'learning_rate': 0.001,
+    'classifier': model.classifier,
+    'epochs': epochs,
+    'state_dict': model.state_dict(),
+    'class_to_idx': model.class_to_idx,
+    'optimizer' : optimizer.state_dict()
+}
+
+if args.save_dir:
+    torch.save (bundle, args.save_dir + '/checkpoint.pth')
+else:
+    torch.save (bundle, 'checkpoint.pth')     
